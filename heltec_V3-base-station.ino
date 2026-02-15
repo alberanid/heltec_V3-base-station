@@ -12,7 +12,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <LoRa.h>
+#include <LoRaWan_APP.h> // Heltec LoRaWan_APP (provides Radio API for raw LoRa)
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -30,17 +30,18 @@ const char* MQTT_USER = "your_username";
 const char* MQTT_PASSWORD = "your_password";
 const char* MQTT_TOPIC = "home/mailbox/status";
 
-// LoRa Configuration (must match mailbox device)
-const long LORA_FREQUENCY = 868E6;      // 868 MHz
-const int LORA_SPREADING_FACTOR = 7;    // SF7
-const int LORA_BANDWIDTH = 125000;      // 125 kHz
-const int LORA_CODING_RATE = 5;         // 4/5
-const byte LORA_SYNC_WORD = 0x14;       // First byte of 0x1424 sync word
+// LoRa Configuration (used by LoRaWan_APP / Radio API)
+const uint32_t LORA_FREQUENCY = 868000000UL; // 868 MHz
+const uint8_t LORA_SPREADING_FACTOR = 7;     // SF7
+// NOTE: the Heltec `Radio.SetRxConfig()` expects the BW and CR as indexes
+// (BW: 0=125kHz,1=250kHz,2=500kHz; CR: 1=4/5,2=4/6,3=4/7,4=4/8).
+const uint8_t LORA_BW = 0;                   // bandwidth index -> 0 = 125 kHz
+const uint8_t LORA_CODING_RATE = 1;          // coding rate index -> 1 = 4/5
+const uint16_t LORA_PREAMBLE = 8;            // preamble length
+const uint16_t LORA_SYMBOL_TIMEOUT = 0;
+const bool LORA_FIX_LENGTH_PAYLOAD_ON = false;
 
-// Heltec Wireless Stick Lite V3 LoRa Pins (verify these for your board version)
-const int LORA_CS = 8;       // NSS/Chip Select (GPIO8)
-const int LORA_RST = 12;     // Reset (GPIO12)
-const int LORA_DIO0 = 14;    // DIO0/IRQ (GPIO14)
+// LoRa pins are handled by `LoRaWan_APP` / board drivers — no manual pin setup required here.
 
 // Serial Debug (comment out to disable)
 #define ENABLE_SERIAL_DEBUG
@@ -58,10 +59,23 @@ const int LORA_DIO0 = 14;    // DIO0/IRQ (GPIO14)
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
+// Radio event structure (LoRaWan_APP)
+static RadioEvents_t RadioEvents;
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
+void OnRxError(void);
+
+// Packet diagnostics (enable for verbose packet logging)
+const bool ENABLE_PACKET_DIAGNOSTICS = true;
+unsigned long packetsReceived = 0;
+unsigned long packetsValid = 0;
+unsigned long packetsInvalid = 0;
+unsigned long lastStatsPrint = 0;
+const unsigned long STATS_INTERVAL = 60000; // print stats every 60s
+
 unsigned long lastWiFiCheck = 0;
 unsigned long lastMQTTCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 5000;  // Check WiFi every 5s
-const unsigned long MQTT_CHECK_INTERVAL = 2000;  // Check MQTT every 2s
+const unsigned long WIFI_CHECK_INTERVAL = 30000;  // Check WiFi every 30s
+const unsigned long MQTT_CHECK_INTERVAL = 15000;  // Check MQTT every 15s
 
 // LoRa packet structure
 struct LoRaPacket {
@@ -91,6 +105,10 @@ void setup() {
     }
   }
   DEBUG_PRINTLN("LoRa initialized successfully");
+  // Print radio configuration for diagnostics
+  if (ENABLE_PACKET_DIAGNOSTICS) {
+    Serial.printf("LoRa config: freq=%lu SF=%u BW_idx=%u CR=%u preamble=%u\n", LORA_FREQUENCY, LORA_SPREADING_FACTOR, LORA_BW, LORA_CODING_RATE, LORA_PREAMBLE);
+  }
   
   // Set up MQTT callbacks
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
@@ -128,34 +146,13 @@ void loop() {
   mqttClient.loop();
   
   // Check for incoming LoRa packet
-  int packetSize = LoRa.parsePacket();
-  if (packetSize == 5) {  // Expected packet size from mailbox
-    DEBUG_PRINTLN("LoRa packet received!");
-    
-    // Read packet bytes
-    uint8_t packetData[5] = {0};
-    for (int i = 0; i < 5; i++) {
-      packetData[i] = LoRa.read();
-    }
-    
-    // Get RSSI for diagnostics
-    int rssi = LoRa.packetRssi();
-    
-    // Parse packet
-    LoRaPacket packet = parseLoRaPacket(packetData);
-    
-    // Validate packet
-    if (packet.nodeID == 0x01 && packet.messageType == 0x01) {
-      DEBUG_PRINTLN("Packet validation passed");
-      
-      // Publish to MQTT
-      publishToMQTT(packet, rssi);
-    } else {
-      DEBUG_PRINT("Invalid packet: Node ID=0x");
-      //DEBUG_PRINT(packet.nodeID, HEX);
-      //DEBUG_PRINT(" Type=0x");
-      //DEBUG_PRINTLN(packet.messageType, HEX);
-    }
+  // Process LoRa radio IRQs — incoming packets handled in OnRxDone()
+  Radio.IrqProcess();
+
+  // Periodic diagnostics even when no packets arrive
+  if (ENABLE_PACKET_DIAGNOSTICS && (millis() - lastStatsPrint >= STATS_INTERVAL)) {
+    lastStatsPrint = millis();
+    Serial.printf("[LoRa Stats] received=%lu valid=%lu invalid=%lu\n", packetsReceived, packetsValid, packetsInvalid);
   }
   
   delay(10);  // Small delay to prevent hogging CPU
@@ -164,29 +161,45 @@ void loop() {
 // ========== LoRa FUNCTIONS ==========
 
 bool initializeLoRa() {
-  // Initialize SPI for Heltec V3 (SCK=9, MISO=11, MOSI=10)
-  SPI.begin(9, 11, 10, LORA_CS);
-  
-  // Set LoRa CS, RESET, and DIO0 pins
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
-  
-  // Initialize LoRa radio
-  if (!LoRa.begin(LORA_FREQUENCY)) {
-    return false;
+  // Initialize MCU / board for radio (handled by LoRaWan_APP)
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+  // Register radio callbacks and initialize radio
+  RadioEvents.RxDone = OnRxDone;
+  RadioEvents.TxDone = NULL;
+  RadioEvents.TxTimeout = NULL;
+  RadioEvents.RxError = OnRxError;
+  RadioEvents.RxTimeout = NULL;
+
+  Radio.Init(&RadioEvents);
+  // Clear any lingering SX126x errors/IRQs and show current status (diagnostic)
+  SX126xClearDeviceErrors();
+  SX126xClearIrqStatus(IRQ_RADIO_ALL);
+  if (ENABLE_PACKET_DIAGNOSTICS) {
+    RadioError_t _devErr = SX126xGetDeviceErrors();
+    Serial.printf("SX126x deviceErrors (post-clear)=0x%04X\n", _devErr.Value);
   }
-  
-  // Configure LoRa parameters
-  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  LoRa.setSignalBandwidth(LORA_BANDWIDTH);
-  LoRa.setCodingRate4(LORA_CODING_RATE);
-  LoRa.setSyncWord(LORA_SYNC_WORD);
-  
-  // Enable CRC
-  LoRa.enableCrc();
-  
-  // Set to receiver mode (continuous RX)
-  LoRa.receive();
-  
+  // Use private sync word to match CubeCell transmitter (Radio.SetPublicNetwork(false) sets sync word 0x1424)
+  Radio.SetPublicNetwork(false);
+  Radio.SetChannel(LORA_FREQUENCY);
+
+  Radio.SetRxConfig(MODEM_LORA,
+                    LORA_BW,
+                    LORA_SPREADING_FACTOR,
+                    LORA_CODING_RATE,
+                    0,                   // bandwidthAFC
+                    LORA_PREAMBLE,
+                    LORA_SYMBOL_TIMEOUT,
+                    LORA_FIX_LENGTH_PAYLOAD_ON,
+                    0,                   // payloadLength
+                    true,                // crcOn
+                    0, 0,
+                    false,
+                    true);               // rxContinuous
+
+  // Start continuous receive
+  Radio.Rx(0);
+
   return true;
 }
 
@@ -198,6 +211,125 @@ LoRaPacket parseLoRaPacket(uint8_t* data) {
   packet.doorOpen = data[3];
   packet.batteryPercent = data[4];
   return packet;
+}
+
+// Helper: print buffer as hex (compact)
+static void printHex(const uint8_t *data, uint16_t len) {
+  for (uint16_t i = 0; i < len; ++i) {
+    Serial.printf("%02X", data[i]);
+    if (i < len - 1) Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// Radio callback: called by LoRaWan_APP Radio when an RF packet is received
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+  packetsReceived++;
+  DEBUG_PRINTLN("OnRxDone: LoRa packet received");
+
+  // Diagnostics: header with size/RSSI/SNR/timestamp
+  if (ENABLE_PACKET_DIAGNOSTICS) {
+    Serial.printf("[LoRa RX] size=%u rssi=%d snr=%d time=%lu\n", size, rssi, snr, millis());
+    Serial.print("[LoRa RX] payload=");
+    printHex(payload, size);
+
+    uint16_t irq = SX126xGetIrqStatus();
+    Serial.printf("IRQ status: 0x%04X", irq);
+    if (irq & IRQ_HEADER_ERROR) Serial.print(" HDR_ERR");
+    if (irq & IRQ_CRC_ERROR) Serial.print(" CRC_ERR");
+    if (irq & IRQ_SYNCWORD_VALID) Serial.print(" SYNC_OK");
+    if (irq & IRQ_HEADER_VALID) Serial.print(" HDR_OK");
+    if (irq & IRQ_RX_DONE) Serial.print(" RX_DONE");
+    Serial.println();
+    SX126xClearIrqStatus(irq);
+  }
+
+  if (size == 5) { // expected 5-byte mailbox packet
+    LoRaPacket packet = parseLoRaPacket(payload);
+
+    // Log parsed fields
+    if (ENABLE_PACKET_DIAGNOSTICS) {
+      Serial.printf("[Parsed] node=0x%02X type=0x%02X hatch=%u door=%u batt=%u\n",
+                    packet.nodeID, packet.messageType, packet.hatchOpen, packet.doorOpen, packet.batteryPercent);
+    }
+
+    // Validate packet (same rules as original)
+    if (packet.nodeID == 0x01 && packet.messageType == 0x01) {
+      packetsValid++;
+      DEBUG_PRINTLN("Packet validation passed (OnRxDone)");
+      publishToMQTT(packet, rssi);
+    } else {
+      packetsInvalid++;
+      DEBUG_PRINT("[Invalid packet] node=0x");
+      Serial.printf("%02X", packet.nodeID);
+      DEBUG_PRINT(" type=0x");
+      Serial.printf("%02X\n", packet.messageType);
+    }
+  } else {
+    packetsInvalid++;
+    DEBUG_PRINT("[Unexpected payload size] ");
+    Serial.println(size);
+
+    // Extra diagnostics when payload size is unexpected (especially size == 0)
+    if (size == 0) {
+      uint8_t hwPayloadLength = 0;
+      uint8_t rxStartBuffer = 0;
+      SX126xGetRxBufferStatus(&hwPayloadLength, &rxStartBuffer);
+      Serial.printf("HW RxBufferStatus: payloadLength=%u rxStartBuffer=%u\n", hwPayloadLength, rxStartBuffer);
+
+      PacketStatus_t pktStatus;
+      SX126xGetPacketStatus(&pktStatus);
+      Serial.printf("HW PacketStatus: packetType=%u rssiPkt=%d snrPkt=%d signalRssi=%d freqError=%lu\n",
+                    pktStatus.packetType,
+                    pktStatus.Params.LoRa.RssiPkt,
+                    pktStatus.Params.LoRa.SnrPkt,
+                    pktStatus.Params.LoRa.SignalRssiPkt,
+                    pktStatus.Params.LoRa.FreqError);
+
+      RadioError_t devErr = SX126xGetDeviceErrors();
+      Serial.printf("HW DeviceErrors: 0x%04X\n", devErr.Value);
+    }
+  }
+
+  // Periodic inline stats (every STATS_INTERVAL)
+  if (ENABLE_PACKET_DIAGNOSTICS && (millis() - lastStatsPrint >= STATS_INTERVAL)) {
+    lastStatsPrint = millis();
+    Serial.printf("[LoRa Stats] received=%lu valid=%lu invalid=%lu\n", packetsReceived, packetsValid, packetsInvalid);
+  }
+
+  // Re-enter RX (continuous)
+  Radio.Rx(0);
+} 
+
+void OnRxError(void) {
+  packetsInvalid++;
+  Serial.println("[LoRa RX] RxError (header/CRC).");
+
+  uint16_t irq = SX126xGetIrqStatus();
+  Serial.printf("IRQ status: 0x%04X\n", irq);
+  SX126xClearIrqStatus(irq);
+
+  uint8_t hwPayloadLength = 0;
+  uint8_t rxStartBuffer = 0;
+  SX126xGetRxBufferStatus(&hwPayloadLength, &rxStartBuffer);
+  Serial.printf("HW RxBufferStatus: payloadLength=%u rxStartBuffer=%u\n", hwPayloadLength, rxStartBuffer);
+
+  PacketStatus_t pktStatus;
+  SX126xGetPacketStatus(&pktStatus);
+  Serial.printf("HW PacketStatus: packetType=%u rssiPkt=%d snrPkt=%d signalRssi=%d freqError=%lu\n",
+                pktStatus.packetType,
+                pktStatus.Params.LoRa.RssiPkt,
+                pktStatus.Params.LoRa.SnrPkt,
+                pktStatus.Params.LoRa.SignalRssiPkt,
+                pktStatus.Params.LoRa.FreqError);
+
+  // Try clearing device errors (XOSC start flag)
+  SX126xClearDeviceErrors();
+  RadioError_t devErr = SX126xGetDeviceErrors();
+  Serial.printf("HW DeviceErrors: 0x%04X\n", devErr.Value);
+
+  // Re-enter RX
+  Radio.Rx(0);
 }
 
 // ========== WiFi FUNCTIONS ==========
