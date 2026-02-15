@@ -30,16 +30,23 @@ const char* MQTT_USER = "your_username";
 const char* MQTT_PASSWORD = "your_password";
 const char* MQTT_TOPIC = "home/mailbox/status";
 
-// LoRa Configuration (used by LoRaWan_APP / Radio API)
-const uint32_t LORA_FREQUENCY = 868000000UL; // 868 MHz
-const uint8_t LORA_SPREADING_FACTOR = 7;     // SF7
-// NOTE: the Heltec `Radio.SetRxConfig()` expects the BW and CR as indexes
-// (BW: 0=125kHz,1=250kHz,2=500kHz; CR: 1=4/5,2=4/6,3=4/7,4=4/8).
-const uint8_t LORA_BW = 0;                   // bandwidth index -> 0 = 125 kHz
-const uint8_t LORA_CODING_RATE = 1;          // coding rate index -> 1 = 4/5
-const uint16_t LORA_PREAMBLE = 8;            // preamble length
-const uint16_t LORA_SYMBOL_TIMEOUT = 0;
-const bool LORA_FIX_LENGTH_PAYLOAD_ON = false;
+// LoRa configuration (Italy 868 MHz)
+#define RF_FREQUENCY                                868000000 // Hz
+#define TX_OUTPUT_POWER                             14        // dBm
+#define LORA_BANDWIDTH                              0         // [0: 125 kHz,
+                                                              //  1: 250 kHz,
+                                                              //  2: 500 kHz,
+                                                              //  3: Reserved]
+#define LORA_SPREADING_FACTOR                       8         // [SF7..SF12]
+#define LORA_CODINGRATE                             4         // [1: 4/5,
+                                                              //  2: 4/6,
+                                                              //  3: 4/7,
+                                                              //  4: 4/8]
+#define LORA_PREAMBLE_LENGTH                        8         // Same for Tx and Rx
+#define LORA_SYMBOL_TIMEOUT                         0         // Symbols
+#define LORA_FIX_LENGTH_PAYLOAD_ON                  false
+#define LORA_IQ_INVERSION_ON                        false
+#define TX_TIMEOUT_VALUE                            3000
 
 // LoRa pins are handled by `LoRaWan_APP` / board drivers — no manual pin setup required here.
 
@@ -107,7 +114,7 @@ void setup() {
   DEBUG_PRINTLN("LoRa initialized successfully");
   // Print radio configuration for diagnostics
   if (ENABLE_PACKET_DIAGNOSTICS) {
-    Serial.printf("LoRa config: freq=%lu SF=%u BW_idx=%u CR=%u preamble=%u\n", LORA_FREQUENCY, LORA_SPREADING_FACTOR, LORA_BW, LORA_CODING_RATE, LORA_PREAMBLE);
+    Serial.printf("LoRa config: freq=%lu SF=%u BW_idx=%u CR=%u preamble=%u\n", RF_FREQUENCY, LORA_SPREADING_FACTOR, LORA_BANDWIDTH, LORA_CODINGRATE, LORA_PREAMBLE_LENGTH);
   }
   
   // Set up MQTT callbacks
@@ -180,15 +187,14 @@ bool initializeLoRa() {
     Serial.printf("SX126x deviceErrors (post-clear)=0x%04X\n", _devErr.Value);
   }
   // Use private sync word to match CubeCell transmitter (Radio.SetPublicNetwork(false) sets sync word 0x1424)
-  Radio.SetPublicNetwork(false);
-  Radio.SetChannel(LORA_FREQUENCY);
+  Radio.SetChannel(RF_FREQUENCY);
 
   Radio.SetRxConfig(MODEM_LORA,
-                    LORA_BW,
+                    LORA_BANDWIDTH,
                     LORA_SPREADING_FACTOR,
-                    LORA_CODING_RATE,
+                    LORA_CODINGRATE,
                     0,                   // bandwidthAFC
-                    LORA_PREAMBLE,
+                    LORA_PREAMBLE_LENGTH,
                     LORA_SYMBOL_TIMEOUT,
                     LORA_FIX_LENGTH_PAYLOAD_ON,
                     0,                   // payloadLength
