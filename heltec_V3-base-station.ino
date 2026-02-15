@@ -32,7 +32,7 @@ const char* MQTT_TOPIC = "home/mailbox/status";
 
 // LoRa configuration (Italy 868 MHz)
 #define RF_FREQUENCY                                868000000 // Hz
-#define TX_OUTPUT_POWER                             14        // dBm
+#define TX_OUTPUT_POWER                             21        // dBm
 #define LORA_BANDWIDTH                              0         // [0: 125 kHz,
                                                               //  1: 250 kHz,
                                                               //  2: 500 kHz,
@@ -46,7 +46,6 @@ const char* MQTT_TOPIC = "home/mailbox/status";
 #define LORA_SYMBOL_TIMEOUT                         0         // Symbols
 #define LORA_FIX_LENGTH_PAYLOAD_ON                  false
 #define LORA_IQ_INVERSION_ON                        false
-#define TX_TIMEOUT_VALUE                            3000
 
 // LoRa pins are handled by `LoRaWan_APP` / board drivers — no manual pin setup required here.
 
