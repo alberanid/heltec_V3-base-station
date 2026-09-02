@@ -1,7 +1,9 @@
 /*
+  SPDX-License-Identifier: Apache-2.0
+
   Heltec Wireless Stick Lite V3 - LoRa to MQTT Base Station
   
-  Receives LoRa packets from mailbox device (868 MHz, SF7)
+  Receives LoRa packets from mailbox device (868 MHz, SF8)
   Parses packet: [Node ID, Message Type, Hatch State, Door State, Battery %]
   Publishes as JSON to MQTT broker over WiFi with retained flag
   
